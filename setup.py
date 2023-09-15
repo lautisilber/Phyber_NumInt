@@ -4,19 +4,19 @@ with open("phyber_numint/README.md", "r") as f:
     long_description = f.read()
 
 setup(
-    name='Phyber NumInt',
-    version='0.1.0',
+    name='phyber_numint',
+    version='0.1.1',
     description='A simple package to perform numerical integration easily',
     package_dir={'': 'phyber_numint'},
     packages=find_packages(where='phyber_numint'),
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='',
+    url='https://github.com/lautisilber/Phyber_NumInt',
     author='Lautaro Silbergleit',
     author_email='lautisilbergleit@gmail.com',
     license='MIT',
     classifiers=[
-        'License :: OSI Aproved :: MIT License',
+        'License :: OSI Approved :: MIT License',
         'Programming Language :: Python :: 3',
         'Operating System :: OS Independent',
         'Intended Audience :: Education',

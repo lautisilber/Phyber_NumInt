@@ -1,4 +1,6 @@
-# Numerical Integrator or solve¿ing ODE systems
+# Phyber NumInt
+
+## A numerical integrator for solving ODE systems
 
 A simple package to solving ODE with different algorithms, written as explicitly as possible. I created this for a University course.
 

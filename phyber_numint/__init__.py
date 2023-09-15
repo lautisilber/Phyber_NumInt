@@ -15,3 +15,5 @@ __all__ = ['ODEIntegrator',
            'lorenz_system',
            'damped_oscillator',
            'damped_oscillator_analytical']
+
+__version__ = '0.1.1'
