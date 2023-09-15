@@ -19,6 +19,11 @@ setup(
         'License :: OSI Aproved :: MIT License',
         'Programming Language :: Python :: 3',
         'Operating System :: OS Independent',
+        'Intended Audience :: Education',
+        'Intended Audience :: Science/Research',
+        'Topic :: Scientific/Engineering',
+        'Topic :: Scientific/Engineering :: Physics',
+        'Topic :: Scientific/Engineering :: Visualization',
     ],
     install_requires=[
         'numpy>=1.20'
