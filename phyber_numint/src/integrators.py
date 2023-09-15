@@ -1,16 +1,20 @@
+from __future__ import annotations
 import numpy as np
 from enum import Enum, auto
-from typing import Callable, TypeAlias, Tuple, Any, Iterable, Dict
+from typing import Callable, Tuple, Any, Iterable, Dict, Optional, Union#, TypeAlias
+import warnings
 try:
     from tqdm.auto import trange, tqdm
     TQDM_EXISTS = True
 except ImportError:
     TQDM_EXISTS = False
+    warnings.warn('tqdm is not installed. Install it to take full advantage of its features')
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_EXISTS = True
 except ImportError:
     MATPLOTLIB_EXISTS = False
+    warnings.warn('matplotlib is not installed. Install it to take full advantage of its features')
 
 
 class IntegrationMethod(Enum):
@@ -26,7 +30,8 @@ class IntegrationMethod(Enum):
     def __str__(self) -> str:
         return ' '.join(self.name.split('_')).title()
 
-F_type: TypeAlias = Callable[[float, Tuple[float, ...], Any], Tuple[float, ...]]
+#F_type: TypeAlias = Callable[[float, Tuple[float, ...], Any], Tuple[float, ...]]
+F_type = Callable[[float, Tuple[float, ...], Any], Tuple[float, ...]]
 
 def _get_iterator(ts, desc, use) -> Iterable:
     '''
@@ -273,7 +278,7 @@ class ODEIntegrator:
         (or system of differential equations) and that takes the X vector and
         produces a new vector with the same shape.
     '''
-    def __init__(self, F: F_type, X0: Tuple[float, ...], ti: float, tf: float, dt: float, integration_method: IntegrationMethod=IntegrationMethod.NONE, error_tolerance: float=1e-6, F_args: Tuple[Any] | None=None, F_kwargs: Dict[str, Any] | None=None) -> None:
+    def __init__(self, F: F_type, X0: Tuple[float, ...], ti: float, tf: float, dt: float, integration_method: IntegrationMethod=IntegrationMethod.NONE, error_tolerance: float=1e-6, F_args: Optional[Tuple[Any]]=None, F_kwargs: Optional[Dict[str, Any]]=None) -> None:
         self.original_F: F_type = F
         self.F_args = F_args if F_args is not None else tuple()
         self.F_kwargs = F_kwargs if F_kwargs is not None else dict()
@@ -286,10 +291,10 @@ class ODEIntegrator:
         self.integration_method = integration_method
         self.error_tolerance = error_tolerance # for adaptative time step methods
 
-        self.ts: np.ndarray | None = None
-        self.Xs: np.ndarray | None = None
+        self.ts: Optional[np.ndarray] = None
+        self.Xs: Optional[np.ndarray] = None
 
-    def set_F_params(self, F_args: Tuple[Any] | None=None, F_kwargs: Dict[str, Any] | None=None) -> None:
+    def set_F_params(self, F_args: Optional[Tuple[Any]]=None, F_kwargs: Optional[Dict[str, Any]]=None) -> None:
         self.F_args = F_args if F_args is not None else tuple()
         self.F_kwargs = F_kwargs if F_kwargs is not None else dict()
         self.F: F_type = lambda *args, **kwargs: np.array(self.original_F(*args, *F_args, **kwargs, **F_kwargs))
@@ -302,7 +307,7 @@ class ODEIntegrator:
             raise TypeError(f'integration_error should be of type {IntegrationMethod} and is of type {type(integration_method)}')
         self.integration_method = integration_method
 
-    def solve(self, integration_method: IntegrationMethod | None=None, show_tqdm: bool=True) -> tuple[np.ndarray, np.ndarray]:
+    def solve(self, integration_method: Optional[IntegrationMethod]=None, show_tqdm: bool=True) -> tuple[np.ndarray, np.ndarray]:
         if integration_method is not None:
             self.set_integration_method(integration_method)
 
@@ -328,7 +333,7 @@ class ODEIntegrator:
         self.Xs = Xs
         return self.ts, self.Xs
 
-    def show(self, axes_to_show: Tuple[int, ...] | bool, with_time: str='none', ts: np.ndarray | None=None, Xs: np.ndarray | None=None, ax=None, plt_args: Tuple[Any, ...] | None=None, plt_kwargs: Dict[str, Any] | None=None, plt_show: bool=False) -> None | Any:
+    def show(self, axes_to_show: Union[Tuple[int, ...], bool], with_time: str='none', ts: Optional[np.ndarray]=None, Xs: Optional[np.ndarray]=None, ax=None, plt_args: Optional[Tuple[Any, ...]]=None, plt_kwargs: Optional[Dict[str, Any]]=None, plt_show: bool=False) -> Union[None, Any]:
         '''
             - axes_to_show is a tuple with the index numbers of the solution that will be shown in the plot. if true, all
               will be shown. if false (don't do this) nothing happens

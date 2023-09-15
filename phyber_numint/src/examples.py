@@ -1,7 +1,7 @@
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Union
 
-def lorenz_system(t: float, X: Tuple[float,...] | np.ndarray, beta: float, sigma: float, rho: float):
+def lorenz_system(t: float, X: Union[Tuple[float,...], np.ndarray], beta: float, sigma: float, rho: float):
     '''
         x' = sigma(y - x)
         y' = x(rho - z) - y
@@ -13,7 +13,7 @@ def lorenz_system(t: float, X: Tuple[float,...] | np.ndarray, beta: float, sigma
     dzdt = x * y - beta * z
     return (dxdt, dydt, dzdt)
 
-def damped_oscillator(t: float, X: Tuple[float,...] | np.ndarray, k: float, nu: float, m: float=1):
+def damped_oscillator(t: float, X: Union[Tuple[float,...], np.ndarray], k: float, nu: float, m: float=1):
     '''
         mx'' + nu x' + k x = 0
 
@@ -25,7 +25,7 @@ def damped_oscillator(t: float, X: Tuple[float,...] | np.ndarray, k: float, nu: 
     v_p = -(nu / m) * v - (k / m) * u
     return (u_p, v_p)
 
-def damped_oscillator_analytical(t: float | np.ndarray, X0: Tuple[float, float], k: float, nu: float, m: float=1):
+def damped_oscillator_analytical(t: Union[float, np.ndarray], X0: Tuple[float, float], k: float, nu: float, m: float=1):
     '''
         Analytical solution to the damped harmonic oscillator.
 
