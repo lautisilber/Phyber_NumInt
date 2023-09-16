@@ -48,7 +48,7 @@ One implementation would be
 ```python
 
 from phyber_numint import ODEIntegrator, IntegrationMethod
-from phyber_numint import lorenz_system
+from phyber_numint.examples import lorenz_system
 
 integ = ODEIntegrator(lorenz_system, (0., .5, .5), 0, 50, 1e-3, F_args=(8/3, 10, 25))
 integ.solve(IntegrationMethod.RUNGE_KUTTA_4)
