@@ -1,14 +1,14 @@
 from setuptools import find_packages, setup
 
-with open("phyber_numint/README.md", "r") as f:
+with open("app/README.md", "r") as f:
     long_description = f.read()
 
 setup(
     name='phyber_numint',
     version='0.1.1',
     description='A simple package to perform numerical integration easily',
-    package_dir={'': 'phyber_numint'},
-    packages=find_packages(where='phyber_numint'),
+    package_dir={'': 'app'},
+    packages=find_packages(where='app'),
     long_description=long_description,
     long_description_content_type='text/markdown',
     url='https://github.com/lautisilber/Phyber_NumInt',
