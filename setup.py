@@ -5,7 +5,7 @@ with open("app/README.md", "r") as f:
 
 setup(
     name='phyber_numint',
-    version='0.1.1',
+    version='0.1.2',
     description='A simple package to perform numerical integration easily',
     package_dir={'': 'app'},
     packages=find_packages(where='app'),

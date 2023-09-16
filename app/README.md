@@ -17,7 +17,7 @@ It takes the following parameters
 The function ```F``` should be structured in the following fashion
 
 ```python
-def F_lorenz(t, X, sigma, beta, rho):
+def lorenz_system(t, X, sigma, beta, rho):
     '''
         x' = sigma(y - x)
         y' = x(rho - z) - y
@@ -42,5 +42,19 @@ Then, the method ```solve``` of ```ODEIntegrator``` can be called with the ```me
 - ```RUNGE_KUTTA_FEHLBERG_45```
 
 For example, ```ode_integrator.solve(IntegrationMethod.EULER_FORWARD)```
+
+One implementation would be
+
+```python
+
+from phyber_numint import ODEIntegrator, IntegrationMethod
+from phyber_numint import lorenz_system
+
+integ = ODEIntegrator(lorenz_system, (0., .5, .5), 0, 50, 1e-3, F_args=(8/3, 10, 25))
+integ.solve(IntegrationMethod.RUNGE_KUTTA_4)
+integ.show(True, plt_show=True)
+integ.show((0,1), 'phase', plt_show=True, plt_kwargs={'s': 2})
+
+```
 
 Examples in the file *examples.py*
