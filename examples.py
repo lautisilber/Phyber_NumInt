@@ -1,5 +1,5 @@
 from phyber_numint import ODEIntegrator, IntegrationMethod
-from phyber_numint import lorenz_system, damped_oscillator, damped_oscillator_analytical
+from phyber_numint.examples import lorenz_system, damped_oscillator, damped_oscillator_analytical
 import matplotlib.pyplot as plt
 
 def lorenz():

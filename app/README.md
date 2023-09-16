@@ -58,3 +58,5 @@ integ.show((0,1), 'phase', plt_show=True, plt_kwargs={'s': 2})
 ```
 
 Examples in the file *examples.py*
+
+Also install ```matplotlib``` and ```tqdm``` to take advantage of every feature
