@@ -46,3 +46,11 @@ def damped_oscillator_analytical(t: Union[float, np.ndarray], X0: Tuple[float, f
     omega_d = np.sqrt(k/m - (nu/(2*m))**2)
     x = np.exp(-nu/(2*m) * t) * (A * np.cos(omega_d * t) + B * np.sin(omega_d * t))
     return x
+
+if __name__ == '__main__':
+    import matplotlib.pyplot as plt
+
+    ts = np.linspace(0, 10)
+    res = damped_oscillator_analytical(ts, (1, 0), 10, 1)
+    plt.plot(ts, res)
+    plt.show()

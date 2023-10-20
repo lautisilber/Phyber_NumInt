@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, Optional, Callable, Union
+from typing import Tuple, List, Optional, Callable, Union
 import numpy as np
 import warnings
 
@@ -18,6 +18,7 @@ except ImportError:
 
 
 physics_equation_T = Callable[[torch.tensor], torch.tensor]
+y_func_T = Union[Callable[[np.ndarray],np.ndarray], Callable[[float],float]]
 
 
 class TensorShapeError(Exception):
@@ -30,9 +31,14 @@ class PINNGridSizeError(Exception):
     pass
 
 
-def np_x_t_to_xt(x: np.ndarray, t: np.ndarray) -> np.ndarray:
-    x_grid, t_grid = np.meshgrid(x, t, indexing='ij')
-    return np.concatenate((x_grid, t_grid), axis=None).reshape((x.shape[0], t.shape[0], 2))
+# def setdiff1d_torch(t1: torch.tensor, t2: torch.tensor) -> torch.tensor:
+#     # https://stackoverflow.com/questions/55110047/finding-non-intersection-of-two-pytorch-tensors
+#     # all values in t2 have to be in t1 as well
+#     combined = torch.cat((t1, t2))
+#     uniques, counts = combined.unique(return_counts=True)
+#     difference = uniques[counts == 1]
+#     # intersection = uniques[counts > 1]
+#     return difference
 
 if TORCH_EXISTS:
     class MLP(torch.nn.Module):
@@ -106,11 +112,11 @@ if TORCH_EXISTS:
 
             self.physics_equation: physics_equation_T = lambda x: x
 
-        def _numpy2torch(self, arr: np.ndarray) -> torch.tensor:
+        def _numpy2torch(self, arr: np.ndarray, requires_grad: bool=False) -> torch.tensor:
             if self.device.type == 'mps':
                 if arr.dtype in (np.float64, np.float80, np.float96, np.float128, np.float256):
                     arr = arr.astype(np.float32)
-            return torch.from_numpy(arr)
+            return torch.tensor(arr, requires_grad=requires_grad)
         
         def _get_input_compatible(self, input: np.ndarray) -> np.ndarray:
             if input.shape[-1] == self.pinn_sizes[0]:
@@ -128,12 +134,13 @@ if TORCH_EXISTS:
                 print('Had to reshape input')
             return input_reshape
         
-        def _get_ys_compatible(self, ys: np.ndarray) -> np.ndarray:
+        def _get_ys_compatible(self, ys: np.ndarray, verbose: bool=True) -> np.ndarray:
             if ys.shape[-1] == self.pinn_sizes[-1]:
                 ys_reshape = ys
             else:
                 ys_reshape = ys.reshape(-1, self.pinn_sizes[-1])
-                print('Had to reshape ys')
+                if verbose:
+                    print('Had to reshape ys')
             return ys_reshape
         
         def _get_input_ys_compatible(self, input: np.ndarray, ys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -156,36 +163,72 @@ if TORCH_EXISTS:
             '''
             self.physics_equation = equation
 
-        def set_init_condition(self, input: np.ndarray, ys: np.ndarray) -> None:
+        def set_init_condition(self, input: np.ndarray, ys: np.ndarray, requires_grad: bool=False) -> None:
             input_init, ys_init = self._get_input_ys_compatible(input, ys)
             if not self._check_input_ys_compatible(input_init, ys_init):
                 raise TensorShapeError('input shape or output shapes are wrong')
-            self.input_init = self._numpy2torch(input_init).to(self.device)
+            self.input_init = self._numpy2torch(input_init, requires_grad).to(self.device)
             self.ys_init = self._numpy2torch(ys_init).to(self.device)
 
-        def set_boundary_condition(self, input: np.ndarray, ys: np.ndarray) -> None:
+        def set_init_condition_constant(self, input: np.ndarray, y: float, requires_grad: bool=False) -> None:
+            input_init = self._get_input_compatible(input)
+            ys = np.empty((*input_init.shape[:-1], self.pinn_sizes[-1])).fill(y)
+            self.set_init_condition(input, ys, requires_grad)
+
+        def set_boundary_condition(self, input: np.ndarray, ys: np.ndarray, requires_grad: bool=False) -> None:
             input_boundary, ys_boundary = self._get_input_ys_compatible(input, ys)
             if not self._check_input_ys_compatible(input_boundary, ys_boundary):
                 raise TensorShapeError('input shape or output shapes are wrong')
-            self.input_boundary = self._numpy2torch(input_boundary).to(self.device)
+            self.input_boundary = self._numpy2torch(input_boundary, requires_grad).to(self.device)
             self.ys_boundary = self._numpy2torch(ys_boundary).to(self.device)
 
-        def set_physics_condition(self, input: np.ndarray) -> None:
+        def set_boundary_condition_constant(self, input: np.ndarray, y: float, requires_grad: bool=False) -> None:
+            input_boundary = self._get_input_compatible(input)
+            ys = np.empty((*input_boundary.shape[:-1], self.pinn_sizes[-1])).fill(y)
+            self.input_boundary(input, ys, requires_grad)
+
+        def set_physics_condition(self, input: np.ndarray, requires_grad: bool=True) -> None:
             input_physics = self._get_input_compatible(input)
-            self.input_physics = self._numpy2torch(input_physics).requires_grad_(True).to(self.device)
+            self.input_physics = self._numpy2torch(input_physics, requires_grad).to(self.device)
 
         @staticmethod
-        def gradient(y_physics: torch.tensor, var_physics: torch.tensor) -> torch.tensor:
+        def gradient(y: torch.tensor, var: torch.tensor) -> torch.tensor:
             '''
-            calculates d(y_physics)/d(var_physics)
-            var_physics should be self.xs_physics or self.ts_physics
+            calculates d(y)/d(var)
+            var should be a slice (or the whole tensor) of self.input_physics
+            (or self.input_init or self.input_boundary, if they have requires_grade = True)
+            (because these values are used as input for the pinn)
             '''
-            return torch.autograd.grad(y_physics, var_physics, torch.ones_like(y_physics), create_graph=True)[0]
+            return torch.autograd.grad(y, var, torch.ones_like(y), create_graph=True)[0]
+        
+        # def _partial_derivative(self, y: torch.tensor, var: torch.tensor, axis: Optional[Union[int, torch.tensor]]=None) -> torch.tensor:
+        #     '''
+        #     Calculates the partial derivative of y with respect to the axis indicated. The shape of the resulting tensor is the same as self.graident
+        #     but zeroes out the axes that do not correspond to the axis that was differentiated against
+        #     '''
+        #     if not y.requires_grad or not var.requires_grad:
+        #         raise Exception('Not all tensors require grad. set requires_grad to True when creating them.')
+        #     grad = self.gradient(y, var)
+        #     if axis is None:
+        #         return grad
+        #     if isinstance(axis, int):
+        #         axis = torch.tensor((axis,), dtype=torch.int)
+        #     indices_to_nullify = setdiff1d_torch(torch.arange(var.shape[-1], dtype=torch.int), axis)
+        #     return grad[...,indices_to_nullify]
         
         @staticmethod
         def loss_function(tensor: torch.tensor) -> float:
             return torch.mean(tensor**2) # MSE
         
+        def train_step(self, input: torch.tensor, optimal: torch.tensor) -> None:
+            if input.shape[-1] != self.pinn_sizes[0] or optimal.shape[-1] != self.pinn_sizes[-1]:
+                raise PINNLayerSizeError('input or optimal are wrong shape')
+            self.pinn_optimizer.zero_grad()
+            res = self.pinn(input)
+            loss = self.loss_function(res - optimal)
+            loss.backward()
+            self.pinn_optimizer.step()
+
         def train(self, iterations: int):
             if TQDM_EXISTS:
                 iter = trange(iterations)
@@ -253,11 +296,15 @@ if TORCH_EXISTS:
             if sizes[0] != 1:
                 raise PINNLayerSizeError(f'Time based PINN should have a input layer of dimension 1, not {sizes[0]}')
             super().__init__(sizes, physics_weight, learning_rate, device)
-            # self.ts_init: Optional[np.ndarray] = None
-            # self.ys_init: Optional[np.ndarray] = None
-            # self.ts_boundary: Optional[np.ndarray] = None
-            # self.ys_boundary: Optional[np.ndarray] = None
-            # self.ts_physics: Optional[np.ndarray] = None
+
+        def set_init_condition(self, ts: np.ndarray, ys: np.ndarray, requires_grad: bool=False) -> None:
+            return super().set_init_condition(ts, ys, requires_grad)
+        
+        def set_boundary_condition(self, ts: np.ndarray, ys: np.ndarray, requires_grad: bool=False) -> None:
+            return super().set_boundary_condition(ts, ys, requires_grad)
+        
+        def set_physics_condition(self, ts: np.ndarray, requires_grad: bool=True) -> None:
+            return super().set_physics_condition(ts, requires_grad)
 
         def dt(self, y_physics: torch.tensor) -> torch.tensor:
             return self.gradient(y_physics, self.input_physics)
@@ -265,108 +312,93 @@ if TORCH_EXISTS:
         def __str__(self) -> str:
             return f'PINN_T({self.pinn_sizes})'
         
-    class PINN_XT(PINN):
+    class PINN_X(PINN):
         def __init__(self, sizes: Tuple[int, ...], physics_weight: float = 0.1, learning_rate: float = 0.0001, device: Optional[Union[torch.device, str]] = None) -> None:
-            if sizes[0] < 2:
-                raise PINNLayerSizeError(f'XT grid based PINN should have a input layer of dimension 12 or greater, not {sizes[0]}')
             super().__init__(sizes, physics_weight, learning_rate, device)
-            self.t_size = 1
-            self.x_size = sizes[0] - 1
-            # self.ts_init: Optional[np.ndarray] = None
-            # self.ys_init: Optional[np.ndarray] = None
-            # self.ts_boundary: Optional[np.ndarray] = None
-            # self.ys_boundary: Optional[np.ndarray] = None
-            self.ts_physics: Optional[torch.tensor] = None
-            self.xs_physics: Optional[Tuple[torch.tensor]] = None
 
-        @staticmethod
-        def _xs_ts_to_xt_grid(xs: np.ndarray, ts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            ts = ts.flatten()
-            xs = xs.reshape(-1, xs.shape[-1])
-            mesh_shape = (*([xs.shape[0]] * xs.shape[-1]), ts.shape[0], xs.shape[-1] + 1)
-            # Create arrays for x, y, and t
-            m = np.array(np.meshgrid(*[xs[:, i] for i in range(xs.shape[-1])], ts)) # each dimension on each of the firs axis' indices
-            # Stack them along the last axis to form the mesh
-            mesh = np.stack(m, axis=-1).reshape(mesh_shape)
-            for i in range(xs.shape[-1] // 2):
-                mesh = np.swapaxes(mesh, i, xs.shape[-1]-i-1)
-            return mesh, m
-        
-        def _get_input_compatible(self, xs: np.ndarray, ts: np.ndarray) -> np.ndarray:
-            mesh, _ = self._xs_ts_to_xt_grid(xs, ts)
-            return mesh
-        
-        def _get_input_compatible_torch(self, xs: torch.tensor, ts: torch.tensor) -> torch.tensor:
-            xs_np = xs.detach().numpy()
-            ts_np = ts.detach().numpy()
-            mesh = self._get_input_compatible(xs_np, ts_np)
-            return self._numpy2torch(mesh).to(self.device)
-        
-        def _get_input_ys_compatible(self, xs: np.ndarray, ts: np.ndarray, ys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            input_reshape = self._get_input_compatible(xs, ts)
-            ys_reshape = self._get_ys_compatible(ys)
-            return input_reshape, ys_reshape
-        
-        def _check_input_ys_compatible(self, xs: np.ndarray, ts: np.ndarray, ys: np.ndarray) -> bool:
-            input_reshape, ys_reshape = self._get_input_ys_compatible(xs, ts, ys)
-            return (
-                np.sum(input_reshape.shape[:-1]) == np.sum(ys_reshape.shape[:-1])
-            )
+            self.x_grids_init: Optional[Tuple[torch.tensor]] = None # we have to store this to be able to differentiate later
+            self.x_grids_boundary: Optional[Tuple[torch.tensor]] = None # we have to store this to be able to differentiate later
+            self.x_grids_physics: Optional[Tuple[torch.tensor]] = None # we have to store this to be able to differentiate later
 
-        def set_init_condition(self, xs: np.ndarray, ts: np.ndarray, ys: np.ndarray) -> None:
-            input = self._get_input_compatible(xs, ts)
-            super().set_init_condition(input, ys)
+        def _xs_to_x_grid_torch(self, *xss, requires_grad: bool=True) -> Tuple[torch.tensor, Tuple[torch.tensor]]:
+            '''
+            x_mesh is the mesh which serves as input
+            x_grid contains at each index the grid of points relevant to make a partial derivative with respect to the variable of that index
+            (that correspondance may be x->0, y->1, z->2, and so on)
+            '''
+            x_grids = tuple(torch.unsqueeze(x_grid, x_grid.ndim).requires_grad_(requires_grad).to(self.device) for x_grid in torch.meshgrid(*xss, indexing='ij'))
+            x_mesh = torch.cat(x_grids, dim=-1)
+            return x_mesh, x_grids
+        
+        def set_init_condition(self, ys: np.ndarray, *xss: np.ndarray, requires_grad: bool=False) -> None:
+            if any(xs.ndim != 1 for xs in xss) or len(xss) != self.pinn_sizes[0] or ys.shape[-1] != self.pinn_sizes[-1] or np.sum(np.sum(xs.shape[:-1]) for xs in xss) != np.sum(ys.shape[:-1]):
+                raise PINNGridSizeError('Shapes are not right')
+            x_mesh, x_grids = self._xs_to_x_grid_torch(*xss, requires_grad)
+            self.x_grids_init = x_grids
+            self.input_init = x_mesh
+        
+        def set_boundary_condition(self, ys: np.ndarray, *xss: np.ndarray, requires_grad: bool=False) -> None:
+            if any(xs.ndim != 1 for xs in xss) or len(xss) != self.pinn_sizes[0] or ys.shape[-1] != self.pinn_sizes[-1] or np.sum(np.sum(xs.shape[:-1]) for xs in xss) != np.sum(ys.shape[:-1]):
+                raise PINNGridSizeError('Shapes are not right')
+            x_mesh, x_grids = self._xs_to_x_grid_torch(*xss, requires_grad)
+            self.x_grids_boundary = x_grids
+            self.input_boundary = x_mesh
 
-        def set_physics_condition(self, xs: np.ndarray, ts:np.ndarray) -> None:
-            input, m = self._xs_ts_to_xt_grid(xs, ts)
-            self.xs_physics = self._numpy2torch(np.expand_dims(m[:-1], axis=-1)).require_grad_(True).to(self.device)
-            self.ts_physics = self._numpy2torch(np.expand_dims(m[-1], axis=-1)).require_grad_(True).to(self.device)
-            return super().set_physics_condition(input)
+        def set_physics_condition(self, *xss: np.ndarray, requires_grad: bool=True) -> None:
+            if any(xs.ndim != 1 for xs in xss) or len(xss) != self.pinn_sizes[0]:
+                raise PINNGridSizeError('Shapes are not right')
+            x_mesh, x_grids = self._xs_to_x_grid_torch(*xss, requires_grad)
+            self.x_grids_physics = x_grids
+            self.input_physics = x_mesh
 
+        def diff(self, y: torch.tensor, var: Tuple[torch.tensor], axis: int) -> torch.tensor:
+            '''
+            differentiates with respect to the variable of the axis provided, that is in var
+            '''
+            return self.gradient(y, var[axis])
+        
+        def diff_physics(self, y_physics: torch.tensor, axis: int) -> torch.tensor:
+            return self.diff(y_physics, self.x_grids_physics, axis)
+        
+        def diff_init(self, y_init: torch.tensor, axis: int) -> torch.tensor:
+            return self.diff(y_init, self.x_grids_init, axis)
+
+        def diff_boundary(self, y_boundary: torch.tensor, axis: int) -> torch.tensor:
+            return self.diff(y_boundary, self.x_grids_boundary, axis)
+        
         def dx(self, y_physics: torch.tensor) -> torch.tensor:
-            return self.gradient(y_physics, self.xs_physics[0])
+            return self.diff_physics(y_physics, 0)
         
         def dy(self, y_physics: torch.tensor) -> torch.tensor:
-            if self.x_size < 2:
-                raise PINNGridSizeError(f'Y dimension does not exist in system with {self.x_size} spatial dimentions')
-            return self.gradient(y_physics, self.xs_physics[1])
+            return self.diff_physics(y_physics, 1)
         
         def dz(self, y_physics: torch.tensor) -> torch.tensor:
-            if self.x_size < 3:
-                raise PINNGridSizeError(f'Z dimension does not exist in system with {self.x_size} spatial dimentions')
-            return self.gradient(y_physics, self.xs_physics[2])
+            return self.diff_physics(y_physics, 2)
         
-        def d_spatial(self, y_physics: torch.tensor, spatial_index: int) -> torch.tensor:
-            if spatial_index >= self.x_size:
-                raise PINNGridSizeError(f'The dimension of index {spatial_index} does not exist in system with {self.x_size} spatial dimentions')
-            return self.gradient(y_physics, self.xs_physics[spatial_index])
-
-        def dt(self, y_physics: torch.tensor) -> torch.tensor:
-            return self.gradient(y_physics, self.ts_physics)
-        
-        def laplacian(self, y_physics: torch.tensor) -> torch.tensor:
-            dt = self.dt(y_physics)
-            dt2 = self.dt(dt)
-            lap = dt2
-            for i in range(self.x_size):
-                di = self.d_spatial(y_physics, i)
-                di2 = self.d_spatial(di, i)
-                lap += di2
-            # is this the same as (don't think so due to tensor sizes)
-            # dX = self.gradient(y_physics, self.xs_physics)
-            # dX2 = self.gradient(dX, self.xs_physics)
-            # lap += dX2
-            return lap
-        
-        def eval(self, xs: np.ndarray, ts: np.ndarray, auto_reshape: bool = True, auto_squeeze: bool = True) -> np.ndarray:
-            input = self._get_input_compatible(xs, ts)
-            return super().eval(input, auto_reshape, auto_squeeze)
-        
-        def __call__(self, xs: np.ndarray, ts: np.ndarray, auto_reshape: bool = True, auto_squeeze: bool = True) -> np.ndarray:
-            return self.eval(xs, ts, auto_reshape, auto_squeeze)
-
         def __str__(self) -> str:
-            return f'PINN_T({self.pinn_sizes})'
+            return f'PINN_X({self.pinn_sizes})'
+
+        
+    class PINN_XT(PINN_X):
+        def __init__(self, sizes: Tuple[int, ...], physics_weight: float = 0.1, learning_rate: float = 0.0001, device: Optional[Union[torch.device, str]] = None) -> None:
+            if sizes[0] < 2:
+                raise PINNLayerSizeError(f'XT grid based PINN should have a input layer of dimension 2 or greater, not {sizes[0]}')
+            super().__init__(sizes, physics_weight, learning_rate, device)
+
+        def set_init_condition(self, ys: np.ndarray, ts:np.ndarray, *xss: np.ndarray, requires_grad: bool=False) -> None:
+            return super().set_init_condition(ys, *xss, ts, requires_grad=requires_grad)
+
+        def set_boundary_condition(self, ys: np.ndarray, ts:np.ndarray, *xss: np.ndarray, requires_grad: bool=False) -> None:
+            return super().set_boundary_condition(ys, *xss, ts, requires_grad=requires_grad)
+        
+        def set_physics_condition(self, ts:np.ndarray, *xss: np.ndarray, requires_grad: bool=True) -> None:
+            return super().set_physics_condition(*xss, ts, requires_grad=requires_grad)
+        
+        def dt(self, y_physics: torch.tensor) -> torch.tensor:
+            return self.diff_physics(y_physics, self.pinn_sizes[0]-1)
+        
+        def __str__(self) -> str:
+            return f'PINN_XT({self.pinn_sizes})'
 
 else:
     class NoTorch:
@@ -379,43 +411,110 @@ else:
     class PINN(NoTorch):
         pass
 
+    class PINN_T(NoTorch):
+        pass
+
+    class PINN_X(NoTorch):
+        pass
+
+    class PINN_XT(NoTorch):
+        pass
+
 
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
 
-    Nx = Nt = 100
-    tf = 2
+    def damped_oscillator_pinn():
+        from examples import damped_oscillator_analytical
+        pinn = PINN([1] + [16]*4 + [1], learning_rate=1e-2, physics_weight=5e-1, device='cpu')
 
-    t_init = np.zeros(Nt)
-    x_init = np.linspace(0, 2*np.pi, Nx)
-    y_init = np.sin(x_init)
+        t_init = np.array([0], dtype=np.float32)
+        y_init = np.array([1], dtype=np.float32)
 
-    t_boundary = np.concatenate((np.linspace(0,tf,Nt), np.linspace(0,tf,Nt)), axis=0)
-    x_boundary = 2*np.pi*np.concatenate((np.zeros(Nx), np.ones(Nx)), axis=0)
-    y_boundary = np.concatenate((np.zeros(Nx), np.zeros(Nt)), axis=0)
+        t_physics = np.linspace(0, 10, 1000, dtype=np.float32)
 
-    t_physics = np.linspace(0, tf, Nt)
-    x_physics = np.linspace(0, 2*np.pi, Nx)
+        def equation(y):
+            # \ddot{x} - mu\dot{x} - kx = 0
+            mu = 1
+            k = 10
+            dxdt = pinn.gradient(y, pinn.input_physics)
+            dxxddt = pinn.gradient(dxdt, pinn.input_physics)
+            return dxxddt + mu*dxdt + k*y
 
-    pinn = PINN([2] + ([20]*8) + [1], learning_rate=1e-5, physics_weight=1e-1)
+        pinn.set_physics_equation(equation)
+        pinn.set_init_condition(t_init, y_init)
+        pinn.set_physics_condition(t_physics)
 
-    def equation(ys: torch.tensor) -> torch.tensor:
-        dt = pinn.dt(ys)
-        dx = pinn.dx(ys)
-        return dt + ys * dx
-    
-    pinn.set_physics_equation(equation)
-    pinn.set_init_condition_xt(x_init, t_init, y_init)
-    pinn.set_boundary_condition_xt(x_boundary, t_boundary, y_boundary)
-    pinn.set_physics_condition_xt(x_physics, t_physics)
+        pinn.train(5000)
 
-    pinn.train(10)
+        res = pinn(t_physics)
+        plt.plot(t_physics, res)
+        plt.plot(t_physics, damped_oscillator_analytical(t_physics, (1, 0), 10, 1))
+        plt.show()
 
-    input = np_x_t_to_xt(x_physics, t_physics)
-    res = pinn(input)
-    plt.close('all')
-    plt.imshow(res)
-    plt.show()
+    damped_oscillator_pinn()
+    def damped_oscillator_pinn_t():
+        from examples import damped_oscillator_analytical
+        pinn = PINN_T([1] + [16]*4 + [1], learning_rate=1e-2, physics_weight=5e-1, device='cpu')
+
+        t_init = np.array([0], dtype=np.float32)
+        y_init = np.array([1], dtype=np.float32)
+
+        t_physics = np.linspace(0, 10, 1000, dtype=np.float32)
+
+        def equation(y):
+            # \ddot{x} - mu\dot{x} - kx = 0
+            mu = 1
+            k = 10
+            dxdt = pinn.dt(y)
+            dxxddt = pinn.dt(dxdt)
+            return dxxddt + mu*dxdt + k*y
+
+        pinn.set_physics_equation(equation)
+        pinn.set_init_condition(t_init, y_init)
+        pinn.set_physics_condition(t_physics)
+
+        pinn.train(5000)
+
+        res = pinn(t_physics)
+        plt.plot(t_physics, res)
+        plt.plot(t_physics, damped_oscillator_analytical(t_physics, (1, 0), 10, 1))
+        plt.show()
+
+    def pinn_xt():
+        Nx = Nt = 100
+        tf = 2
+
+        pinn = PINN_XT([2] + ([20]*8) + [1], learning_rate=1e-5, physics_weight=1e-1, device='cpu')
+        
+        t_init = np.zeros(Nt)
+        x_init = np.linspace(0, 2*np.pi, Nx)
+        xt_init = pinn.create_grid(x_init, t_init)
+
+        t_boundary = np.concatenate((np.linspace(0,tf,Nt), np.linspace(0,tf,Nt)), axis=0)
+        x_boundary = 2*np.pi*np.concatenate((np.zeros(Nx), np.ones(Nx)), axis=0)
+        y_boundary = np.concatenate((np.zeros(Nx), np.zeros(Nt)), axis=0)
+
+        t_physics = np.linspace(0, tf, Nt)
+        x_physics = np.linspace(0, 2*np.pi, Nx)
+
+        def equation(ys: torch.tensor) -> torch.tensor:
+            dt = pinn.dt(ys)
+            dx = pinn.dx(ys)
+            return dt + ys * dx
+        
+        pinn.set_physics_equation(equation)
+        pinn.set_init_condition_func(x_init, t_init, np.sin, axis=0)
+        pinn.set_boundary_condition(x_boundary, t_boundary, y_boundary)
+        pinn.set_physics_condition(x_physics, t_physics)
+
+        pinn.train(10)
+
+        input = pinn._get_input_compatible(x_physics, t_physics)
+        res = pinn(input)
+        plt.close('all')
+        plt.imshow(res)
+        plt.show()
 
 
     # from examples import damped_oscillator_analytical
