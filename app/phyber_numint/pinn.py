@@ -2,8 +2,10 @@ from __future__ import annotations
 from typing import Tuple, List, Optional, Callable, Union
 import numpy as np
 import warnings
+from numpy import ndarray
 
 import torch
+from torch._C import device
 try:
     import torch
     TORCH_EXISTS = True
@@ -12,15 +14,14 @@ except ImportError:
     warnings.warn(
         'torch is not installed. Install it to take full advantage of its features')
 try:
-    from tqdm.auto import trange, tqdm
+    from tqdm.auto import trange
     TQDM_EXISTS = True
 except ImportError:
     TQDM_EXISTS = False
 
 
-physics_equation_T = Callable[[torch.tensor], torch.tensor]
-y_func_T = Union[Callable[[np.ndarray], np.ndarray], Callable[[float], float]]
-
+physics_equation_t = Union[Callable[[Tuple[torch.tensor]], torch.tensor], Callable[[torch.tensor], torch.tensor]]
+array_t = Union[np.ndarray, torch.Tensor]
 
 class TensorShapeError(Exception):
     pass
@@ -88,12 +89,28 @@ if TORCH_EXISTS:
             return y
 
     class PINN:
-        def __init__(self, sizes: Tuple[int, ...], physics_weight: float = 1e-1, learning_rate: float = 1e-4, device: Optional[Union[torch.device, str]] = None) -> None:
+        def __init__(self, sizes: Tuple[int, ...],
+                     initial_conditions_input: Optional[Tuple[np.ndarray]], initial_conditions_output: Optional[np.ndarray],
+                     boundary_conditions_input: Optional[Tuple[np.ndarray]], boundary_conditions_output: Optional[np.ndarray],
+                     physics_evaluation_input: Optional[Tuple[np.ndarray]],
+                     initial_conditions_grad: bool=False, boundary_conditions_grad: bool=False, physics_grad: bool=True,
+                     physics_weight: float = 1e-1, learning_rate: float = 1e-4, device: Optional[Union[torch.device, str]] = None) -> None:
+
+            # The '*_input' variables are tuples. Each element of the tuples are arrays with the discretized steps that will be evaluated
+            # for each dimension. For example, if the time domain is 1D (t) and the spatial domain is 2D (x, y) and, specifically, the
+            # following discretization was made: t = linspace(0, 5, 5), x = linspace(6, 9, 3), y = linspace(10, 12, 2) the following 3D grid
+            # will be created as a input: concatenate(t_grid, x_grid, y_grid), with t_grid, x_grid, y_grod = meshgrid(t, x, y, indexing='ij')
+            # this allows the differentiation between t, x and y variables for partial derivatives.
+
+            if not(len(initial_conditions_input) == len(initial_conditions_input) == len(physics_evaluation_input)):
+                raise PINNDimensionError('Not all inputs are of same dimension')
+            self.input_ndim = len(physics_evaluation_input)
+            if self.input_ndim != sizes[0]:
+                raise PINNDimensionError(f'The input dimension of the network ({sizes[0]}) is not the same as the number of dimensions of the domain ({self.input_ndim})')
+
             self.pinn_sizes = sizes
             self.physics_weight = physics_weight
             self.pinn_learning_rate = learning_rate
-
-            self.ts_training_physics: Optional[torch.tensor] = None
 
             if isinstance(device, str):
                 try:
@@ -109,16 +126,60 @@ if TORCH_EXISTS:
             self.pinn = MLP(self.pinn_sizes).to(self.device)
             self.pinn_optimizer = torch.optim.Adam(
                 self.pinn.parameters(), lr=self.pinn_learning_rate)
+            
+            # the '*_grad' parameters inidcate wether for initial_conditions, boundary_conditions or the physics
+            # the gradient needs to be tracked to make derivatives
 
-            self.input_init: Optional[torch.tensor] = None
-            self.ys_init: Optional[torch.tensor] = None  # ys work as output
+            # initial conditions
+            # these are the inputs and outputs that are going to be evaluated for the input conditions
+            self.train_with_init: bool = initial_conditions_input is not None and initial_conditions_output is not None
+            if self.train_with_init:
+                self.init_input, self.init_grids = self._grid_from_dims(initial_conditions_input, initial_conditions_grad)
+                if not initial_conditions_input.shape[-1] == self.pinn_sizes[0]:
+                    raise PINNLayerSizeError('initial_conditions_input shape wrong')
+                if not initial_conditions_output.shape[-1] == self.pinn_sizes[-1]:
+                    raise PINNLayerSizeError('initial_conditions_output shape wrong')
+                self.init_output: Optional[torch.tensor] = self._numpy2torch_smart(initial_conditions_output, initial_conditions_grad)
+            else:
+                self.init_input: Optional[torch.tensor] = None
+                self.init_output: Optional[torch.tensor] = None
+                self.init_grids: Optional[Tuple[torch.tensor,...]] = None
 
-            self.input_boundary: Optional[torch.tensor] = None
-            self.ys_boundary: Optional[torch.tensor] = None
+            # boundary conditions
+            # these are the inputs and outputs that are going to be evaluated for the boundary conditions
+            self.train_with_boundary: bool = boundary_conditions_input is not None and boundary_conditions_output is not None
+            if self.train_with_boundary:
+                self.boundary_input, self.boundary_grids = self._grid_from_dims(boundary_conditions_input)
+                if not boundary_conditions_input.shape[-1] == self.pinn_sizes[0]:
+                    raise PINNLayerSizeError('boundary_conditions_input shape wrong')
+                if not boundary_conditions_output.shape[-1] == self.pinn_sizes[-1]:
+                    raise PINNLayerSizeError('boundary_conditions_output shape wrong')
+                self.boundary_output: Optional[torch.tensor] = self._numpy2torch_smart(boundary_conditions_output, boundary_conditions_grad)
+            else:
+                self.boundary_input: Optional[torch.tensor] = None
+                self.boundary_output: Optional[torch.tensor] = None
+                self.boundary_grids: Optional[Tuple[torch.tensor,...]] = None
 
-            self.input_physics: Optional[torch.tensor] = None
+            # physics
+            self.train_with_physics: bool =  physics_evaluation_input is not None
+            if self.train_with_physics:
+                self.physics_input, self.physics_grids = self._grid_from_dims(boundary_conditions_input, physics_grad)
+                if not physics_evaluation_input.shape[-1] == self.pinn_sizes[0]:
+                    raise PINNLayerSizeError('physics_evaluation_input shape wrong')
+            else:
+                self.physics_input: Optional[torch.tensor] = None
+                self.physics_grids: Optional[Tuple[torch.tensor,...]] = None
 
-            self.physics_equation: physics_equation_T = lambda x: x
+            self.physics_equation: physics_equation_t = lambda x: x
+
+        def add_physics_equation(self, physics_equation: physics_equation_t) -> None:
+            '''
+            equation is a function that takes a torch.tensor as input and outputs a torch.tensor
+            The input is the currently calculated values by the pinn. The equation function should
+            manipulate these values to shape them in to the physical equation that describes the system
+            equated to zero. You can use the gradient, dx and dt member methods to calculate derivatives
+            '''
+            self.physics_equation = physics_equation
 
         def _numpy2torch(self, arr: np.ndarray, requires_grad: bool = False) -> torch.tensor:
             if self.device.type == 'mps':
@@ -128,96 +189,26 @@ if TORCH_EXISTS:
         
         def _numpy2torch_smart(self, arr: np.ndarray, requires_grad: bool = False) -> torch.tensor:
             if isinstance(arr, np.ndarray):
-                return self._numpy2torch(arr).to(self.device)
+                return self._numpy2torch(arr, requires_grad).to(self.device)
             if not isinstance(arr, torch.Tensor):
                 raise TypeError(f'arr is not of type numpy.ndarray or torch.Tensor. Instead is of type {type(arr)}')
             if input.device != self.device:
                 arr = arr.to(self.device)
             return arr
-
-        def _get_input_compatible(self, input: np.ndarray) -> np.ndarray:
-            if input.shape[-1] == self.pinn_sizes[0]:
-                input_reshape = input
-            else:
-                input_reshape = input.reshape(-1, self.pinn_sizes[0])
-                print('Had to reshape input')
-            return input_reshape
-
-        def _get_input_compatible_torch(self, input: torch.tensor) -> torch.tensor:
-            if input.shape[-1] == self.pinn_sizes[0]:
-                input_reshape = input
-            else:
-                input_reshape = input.view(-1, self.pinn_sizes[0])
-                print('Had to reshape input')
-            return input_reshape
-
-        def _get_ys_compatible(self, ys: np.ndarray, verbose: bool = True) -> np.ndarray:
-            if ys.shape[-1] == self.pinn_sizes[-1]:
-                ys_reshape = ys
-            else:
-                ys_reshape = ys.reshape(-1, self.pinn_sizes[-1])
-                if verbose:
-                    print('Had to reshape ys')
-            return ys_reshape
-
-        def _get_input_ys_compatible(self, input: np.ndarray, ys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            input_reshape = self._get_input_compatible(input)
-            ys_reshape = self._get_ys_compatible(ys)
-            return input_reshape, ys_reshape
-
-        def _check_input_ys_compatible(self, input: np.ndarray, ys: np.ndarray) -> bool:
-            input_reshape, ys_reshape = self._get_input_ys_compatible(
-                input, ys)
-            return (
-                np.sum(input_reshape.shape[:-1]
-                       ) == np.sum(ys_reshape.shape[:-1])
-            )
-
-        def set_physics_equation(self, equation: physics_equation_T) -> None:
+        
+        def _grid_from_dims(self, dims: Tuple[np.ndarray,...], requires_grad:bool=False) -> Tuple[torch.Tensor, Tuple[torch.Tensor,...]]:
             '''
-            equation is a function that takes a torch.tensor as input and outputs a torch.tensor
-            The input is the currently calculated values by the pinn. The equation function should
-            manipulate these values to shape them in to the physical equation that describes the system
-            equated to zero. You can use the gradient, dx and dt member methods to calculate derivatives
+            This function takes a tuple of arrays, typically linspaces or aranges. Each array contains
+            the information of the discretization along one axis or dimension (the number of dimensions
+            is equal to len(dims)). This funcion turns those arrays into a single array, input, that is
+            a grid that is the input of the network. It also returns a tuple of arrays that can be used
+            to partially differentiate the network along each dimsnion or axis.
             '''
-            self.physics_equation = equation
-
-        def set_init_condition(self, input: np.ndarray, ys: np.ndarray, requires_grad: bool = False) -> None:
-            input_init, ys_init = self._get_input_ys_compatible(input, ys)
-            if not self._check_input_ys_compatible(input_init, ys_init):
-                raise TensorShapeError(
-                    'input shape or output shapes are wrong')
-            self.input_init = self._numpy2torch(
-                input_init, requires_grad).to(self.device)
-            self.ys_init = self._numpy2torch(ys_init).to(self.device)
-
-        def set_init_condition_constant(self, input: np.ndarray, y: float, requires_grad: bool = False) -> None:
-            input_init = self._get_input_compatible(input)
-            ys = np.empty(
-                (*input_init.shape[:-1], self.pinn_sizes[-1])).fill(y)
-            self.set_init_condition(input, ys, requires_grad)
-
-        def set_boundary_condition(self, input: np.ndarray, ys: np.ndarray, requires_grad: bool = False) -> None:
-            input_boundary, ys_boundary = self._get_input_ys_compatible(
-                input, ys)
-            if not self._check_input_ys_compatible(input_boundary, ys_boundary):
-                raise TensorShapeError(
-                    'input shape or output shapes are wrong')
-            self.input_boundary = self._numpy2torch(
-                input_boundary, requires_grad).to(self.device)
-            self.ys_boundary = self._numpy2torch(ys_boundary).to(self.device)
-
-        def set_boundary_condition_constant(self, input: np.ndarray, y: float, requires_grad: bool = False) -> None:
-            input_boundary = self._get_input_compatible(input)
-            ys = np.empty(
-                (*input_boundary.shape[:-1], self.pinn_sizes[-1])).fill(y)
-            self.input_boundary(input, ys, requires_grad)
-
-        def set_physics_condition(self, input: np.ndarray, requires_grad: bool = True) -> None:
-            input_physics = self._get_input_compatible(input)
-            self.input_physics = self._numpy2torch(
-                input_physics, requires_grad).to(self.device)
-
+            grids = torch.meshgrid(*(self._numpy2torch_smart(d) for d in dims), indexing='ij')
+            grids = tuple(torch.unsqueeze(g, -1).requires_grad_(requires_grad) for g in grids)
+            input = torch.cat(grids, dim=-1)
+            return input, grids
+        
         @staticmethod
         def gradient(y: torch.tensor, var: torch.tensor) -> torch.tensor:
             '''
@@ -227,35 +218,34 @@ if TORCH_EXISTS:
             (because these values are used as input for the pinn)
             '''
             return torch.autograd.grad(y, var, torch.ones_like(y), create_graph=True)[0]
+        
+        def init_axis(self, axis: int) -> torch.Tensor:
+            return self.init_grids[axis]
+        
+        def boundary_axis(self, axis: int) -> torch.Tensor:
+            return self.boundary_grids[axis]
+        
+        def physics_axis(self, axis: int) -> torch.Tensor:
+            return self.physics_grids[axis]
 
-        # def _partial_derivative(self, y: torch.tensor, var: torch.tensor, axis: Optional[Union[int, torch.tensor]]=None) -> torch.tensor:
-        #     '''
-        #     Calculates the partial derivative of y with respect to the axis indicated. The shape of the resulting tensor is the same as self.graident
-        #     but zeroes out the axes that do not correspond to the axis that was differentiated against
-        #     '''
-        #     if not y.requires_grad or not var.requires_grad:
-        #         raise Exception('Not all tensors require grad. set requires_grad to True when creating them.')
-        #     grad = self.gradient(y, var)
-        #     if axis is None:
-        #         return grad
-        #     if isinstance(axis, int):
-        #         axis = torch.tensor((axis,), dtype=torch.int)
-        #     indices_to_nullify = setdiff1d_torch(torch.arange(var.shape[-1], dtype=torch.int), axis)
-        #     return grad[...,indices_to_nullify]
-
-        @staticmethod
-        def loss_function(tensor: torch.tensor) -> float:
-            return torch.mean(tensor**2)  # MSE
-
-        def train_step(self, input: torch.tensor, optimal: torch.tensor) -> None:
-            if input.shape[-1] != self.pinn_sizes[0] or optimal.shape[-1] != self.pinn_sizes[-1]:
-                raise PINNLayerSizeError('input or optimal are wrong shape')
-            self.pinn_optimizer.zero_grad()
-            res = self.pinn(input)
-            loss = self.loss_function(res - optimal)
-            loss.backward()
-            self.pinn_optimizer.step()
-
+        def partial_diff_init(self, output: torch.tensor, axis: int) -> torch.tensor:
+            '''
+            partially differentiates with respect to the axis or dimension of the axis index (axis) provided, for the initial conditions
+            '''
+            return self.gradient(output, self.init_axis(axis))
+        
+        def partial_diff_boundary(self, output: torch.tensor, axis: int) -> torch.tensor:
+            '''
+            partially differentiates with respect to the axis or dimension of the axis index (axis) provided, for the boundary conditions
+            '''
+            return self.gradient(output, self.boundary_axis(axis))
+        
+        def partial_diff_physics(self, output: torch.tensor, axis: int) -> torch.tensor:
+            '''
+            partially differentiates with respect to the axis or dimension of the axis index (axis) provided, for the physics evaluation points
+            '''
+            return self.gradient(output, self.physics_axis(axis))
+        
         def train(self, iterations: int):
             if TQDM_EXISTS:
                 iter = trange(iterations)
@@ -265,24 +255,24 @@ if TORCH_EXISTS:
                 self.pinn_optimizer.zero_grad()
 
                 # initial conditions
-                if self.input_init is not None:
-                    y_init = self.pinn(self.input_init)
-                    loss_init = self.loss_function(y_init-self.ys_init)
+                if self.train_with_init:
+                    init_output = self.pinn(self.input_init)
+                    loss_init = self.loss_function(init_output-self.init_output)
                 else:
                     loss_init = 0
 
                 # boundary conditions
-                if self.input_boundary is not None:
-                    y_boundary = self.pinn(self.input_boundary)
+                if self.train_with_boundary:
+                    boundary_output = self.pinn(self.input_boundary)
                     loss_boundary = self.loss_function(
-                        y_boundary - self.ys_boundary)
+                        boundary_output - self.boundary_output)
                 else:
                     loss_boundary = 0
 
                 # physics
-                if self.input_physics is not None:
-                    y_physics = self.pinn(self.input_physics)
-                    equation = self.physics_equation(y_physics)
+                if self.train_with_physics:
+                    physics_output = self.pinn(self.physics_input)
+                    equation = self.physics_equation(physics_output)
                     loss_physics = self.loss_function(equation)
                 else:
                     loss_physics = 0
@@ -301,158 +291,255 @@ if TORCH_EXISTS:
                         else:
                             print(epoch, "- Traning Loss:", loss.data)
 
-        def eval(self, input: Union[np.ndarray, torch.tensor], auto_reshape: bool = True, auto_squeeze: bool = True) -> np.ndarray:
-            input = self._numpy2torch_smart(input)
-            input_compatible = self._get_input_compatible_torch(
-                input) if auto_reshape else input
-            result = self.pinn(input_compatible)
-            result_np = result.detach().cpu().numpy()
-            if auto_squeeze:
-                return result_np.squeeze()
-            return result_np
+            def eval(self, input: Union[np.ndarray, torch.tensor], auto_squeeze: bool=True) -> np.ndarray:
+                if not input.shape[-1] == self.pinn_sizes[0]:
+                    raise PINNLayerSizeError('input has wring shape')
+                input = self._numpy2torch_smart(input)
+                result = self.pinn(input)
+                result_np = result.detach().cpu().numpy()
+                if auto_squeeze:
+                    return result_np.squeeze()
+                return result_np
 
-        def __call__(self, input: Union[np.ndarray, torch.tensor], auto_reshape: bool = True, auto_squeeze: bool = True) -> np.ndarray:
-            return self.eval(input, auto_reshape, auto_squeeze)
+            def __call__(self, input: Union[np.ndarray, torch.tensor], auto_squeeze: bool=True) -> np.ndarray:
+                return self.eval(input, auto_squeeze)
 
-        def __str__(self) -> str:
-            return f'PINN({self.pinn_sizes})'
+            def __str__(self) -> str:
+                return f'PINN({self.pinn_sizes})'
 
-        def __repr__(self) -> str:
-            return self.__str__()
+            def __repr__(self) -> str:
+                return self.__str__()
 
-    class PINN_T(PINN):
-        def __init__(self, sizes: Tuple[int, ...], physics_weight: float = 0.1, learning_rate: float = 0.0001, device: Optional[Union[torch.device, str]] = None) -> None:
-            if sizes[0] != 1:
-                raise PINNLayerSizeError(
-                    f'Time based PINN should have a input layer of dimension 1, not {sizes[0]}')
-            super().__init__(sizes, physics_weight, learning_rate, device)
-
-        def set_init_condition(self, ts: np.ndarray, ys: np.ndarray, requires_grad: bool = False) -> None:
-            return super().set_init_condition(ts, ys, requires_grad)
-
-        def set_boundary_condition(self, ts: np.ndarray, ys: np.ndarray, requires_grad: bool = False) -> None:
-            return super().set_boundary_condition(ts, ys, requires_grad)
-
-        def set_physics_condition(self, ts: np.ndarray, requires_grad: bool = True) -> None:
-            return super().set_physics_condition(ts, requires_grad)
-
-        def dt(self, y_physics: torch.tensor) -> torch.tensor:
-            return self.gradient(y_physics, self.input_physics)
-
-        def __str__(self) -> str:
-            return f'PINN_T({self.pinn_sizes})'
-
-    class PINN_X(PINN):
-        def __init__(self, sizes: Tuple[int, ...], physics_weight: float = 0.1, learning_rate: float = 0.0001, device: Optional[Union[torch.device, str]] = None) -> None:
-            super().__init__(sizes, physics_weight, learning_rate, device)
-
-            # The x_grid variables are tuples of arrays that have shape (a, b), where a is the amount
-            # of dimensions the spatial domain has (for example x y z is 3d and has
-            # a dimension of 3) and b is the amount of discrete dots that dimension has.
-            # For example if the first dimension, x, should be a linspace(0, 1, 100), a
-            # is 100
-    
-            # we have to store this to be able to differentiate later
-            self.x_grid_init: Optional[Tuple[torch.tensor]] = None
-            # we have to store this to be able to differentiate later
-            self.x_grid_boundary: Optional[Tuple[torch.tensor]] = None
-            # we have to store this to be able to differentiate later
-            self.x_grid_physics: Optional[Tuple[torch.tensor]] = None
-
-            self.n_dim_input: Optional[int] = None
-            self.n_dim_boundary: Optional[int] = None
-            self.n_dim_physics: Optional[int] = None
-
-        def _xs_to_x_grid_torch(self, *xss, requires_grad: bool = True) -> Tuple[torch.tensor, Tuple[torch.tensor]]:
+    class PINN_1D(PINN):
+        def __init__(self, sizes: Tuple[int, ...], initial_conditions_input: Optional[np.ndarray], initial_conditions_output: Optional[np.ndarray], boundary_conditions_input: Optional[np.ndarray], boundary_conditions_output: Optional[np.ndarray], physics_evaluation_input: Optional[np.ndarray], initial_conditions_grad: bool = False, boundary_conditions_grad: bool = False, physics_grad: bool = True, physics_weight: float = 0.1, learning_rate: float = 0.0001, device: device | str | None = None) -> None:
+            super().__init__(sizes,
+                             tuple(initial_conditions_input) if initial_conditions_input is not None else initial_conditions_input, initial_conditions_output,
+                             tuple(boundary_conditions_input) if boundary_conditions_input is not None else boundary_conditions_input, boundary_conditions_output,
+                             tuple(physics_evaluation_input) if physics_evaluation_input is not None else physics_evaluation_input, initial_conditions_grad,
+                             boundary_conditions_grad, physics_grad, physics_weight, learning_rate, device)
             '''
-            x_grids contains at each index the grid of points relevant to make a partial derivative with respect to the variable of that index
-            (that correspondance may be x->0, y->1, z->2, and so on)
-            x_mesh is the mesh which serves as input (it's just the x_grids concatenated)
+            assumes only dimension is time (t)
             '''
-            xss = tuple(self._numpy2torch(xs) for xs in xss)
-            x_grids = tuple(torch.unsqueeze(x_grid, x_grid.ndim).requires_grad_(
-                requires_grad).to(self.device) for x_grid in torch.meshgrid(*xss, indexing='ij'))
-            x_mesh = torch.cat(x_grids, dim=-1) # TODO: check that dim is ok and there are no extra dims
-            return x_mesh, x_grids
-
-        def set_init_condition(self, ys: np.ndarray, *xss: np.ndarray, requires_grad: bool = False) -> None:
-            if any(xs.ndim != 1 for xs in xss) or len(xss) != self.pinn_sizes[0] or ys.shape[-1] != self.pinn_sizes[-1] or np.sum(np.sum(xs.shape[:-1]) for xs in xss) != np.sum(ys.shape[:-1]):
-                raise PINNGridSizeError('Shapes are not right')
-            x_mesh, x_grids = self._xs_to_x_grid_torch(*xss, requires_grad=requires_grad)
-            self.x_grid_init = x_grids
-            self.n_dim_input = len(x_grids)
-            self.input_init = x_mesh
-            self.ys_init = self._numpy2torch_smart(ys)
-
-        def set_boundary_condition(self, ys: np.ndarray, *xss: np.ndarray, requires_grad: bool = False) -> None:
-            if any(xs.ndim != 1 for xs in xss) or len(xss) != self.pinn_sizes[0] or ys.shape[-1] != self.pinn_sizes[-1] or np.sum(np.sum(xs.shape[:-1]) for xs in xss) != np.sum(ys.shape[:-1]):
-                raise PINNGridSizeError('Shapes are not right')
-            x_mesh, x_grids = self._xs_to_x_grid_torch(*xss, requires_grad=requires_grad)
-            self.x_grid_boundary = x_grids
-            self.n_dim_boundary = len(x_grids)
-            self.input_boundary = x_mesh
-            self.ys_boundary = self._numpy2torch_smart(ys)
-
-        def set_physics_condition(self, *xss: np.ndarray, requires_grad: bool = True) -> None:
-            if any(xs.ndim != 1 for xs in xss) or len(xss) != self.pinn_sizes[0]:
-                raise PINNGridSizeError('Shapes are not right')
-            x_mesh, x_grids = self._xs_to_x_grid_torch(*xss, requires_grad=requires_grad)
-            self.x_grid_physics = x_grids
-            self.n_dim_physics = len(x_grids)
-            self.input_physics = x_mesh
-
-        def diff(self, y: torch.tensor, var: Tuple[torch.tensor], axis: int) -> torch.tensor:
+        
+        def dt(self, output: torch.tensor) -> torch.Tensor:
             '''
-            differentiates with respect to the variable of the axis provided, that is in var
+            derivative with respect to time for the physics evaluation points
             '''
-            return self.gradient(y, var[axis])
+            return self.partial_diff_physics(output, 0)
+        
+        def dt_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the initial condition
+            '''
+            return self.partial_diff_init(output, 0)
+        
+        def dt_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 0)
+        
+    class PINN_2D(PINN):
+        def __init__(self, sizes: Tuple[int, ...], initial_conditions_input: Optional[np.ndarray], initial_conditions_output: Optional[np.ndarray], boundary_conditions_input: Optional[np.ndarray], boundary_conditions_output: Optional[np.ndarray], physics_evaluation_input: Optional[np.ndarray], initial_conditions_grad: bool = False, boundary_conditions_grad: bool = False, physics_grad: bool = True, physics_weight: float = 0.1, learning_rate: float = 0.0001, device: device | str | None = None) -> None:
+            super().__init__(sizes,
+                             initial_conditions_input, initial_conditions_output,
+                             boundary_conditions_input, boundary_conditions_output,
+                             physics_evaluation_input, initial_conditions_grad,
+                             boundary_conditions_grad, physics_grad, physics_weight, learning_rate, device)
+            if not self.input_ndim == 2:
+                raise PINNDimensionError(f'Domain dimension is not 2 (it is {self.input_ndim})')
+            '''
+            assumes dimensions (x, t)
+            '''
+        
+        def dx(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to space for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 0)
+        
+        def dx_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to space for the initial condition
+            '''
+            return self.partial_diff_init(output, 0)
+        
+        def dx_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to space for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 0)
+        
+        def dt(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 1)
+        
+        def dt_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the initial condition
+            '''
+            return self.partial_diff_init(output, 1)
+        
+        def dt_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 1)
+        
+    class PINN_3D(PINN):
+        def __init__(self, sizes: Tuple[int, ...], initial_conditions_input: Optional[np.ndarray], initial_conditions_output: Optional[np.ndarray], boundary_conditions_input: Optional[np.ndarray], boundary_conditions_output: Optional[np.ndarray], physics_evaluation_input: Optional[np.ndarray], initial_conditions_grad: bool = False, boundary_conditions_grad: bool = False, physics_grad: bool = True, physics_weight: float = 0.1, learning_rate: float = 0.0001, device: device | str | None = None) -> None:
+            super().__init__(sizes,
+                             initial_conditions_input, initial_conditions_output,
+                             boundary_conditions_input, boundary_conditions_output,
+                             physics_evaluation_input, initial_conditions_grad,
+                             boundary_conditions_grad, physics_grad, physics_weight, learning_rate, device)
+            if not self.input_ndim == 3:
+                raise PINNDimensionError(f'Domain dimension is not 3 (it is {self.input_ndim})')
+            '''
+            assumes dimensions (x, y, t)
+            '''
+        
+        def dx(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 0)
+        
+        def dx_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the initial condition
+            '''
+            return self.partial_diff_init(output, 0)
+        
+        def dx_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 0)
+        
+        def dy(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to y for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 1)
+        
+        def dy_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to y for the initial condition
+            '''
+            return self.partial_diff_init(output, 1)
+        
+        def dy_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to y for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 1)
+        
+        def dt(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 2)
+        
+        def dt_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the initial condition
+            '''
+            return self.partial_diff_init(output, 2)
+        
+        def dt_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 2)
+        
+    class PINN_4D(PINN):
+        def __init__(self, sizes: Tuple[int, ...], initial_conditions_input: Optional[np.ndarray], initial_conditions_output: Optional[np.ndarray], boundary_conditions_input: Optional[np.ndarray], boundary_conditions_output: Optional[np.ndarray], physics_evaluation_input: Optional[np.ndarray], initial_conditions_grad: bool = False, boundary_conditions_grad: bool = False, physics_grad: bool = True, physics_weight: float = 0.1, learning_rate: float = 0.0001, device: device | str | None = None) -> None:
+            super().__init__(sizes,
+                             initial_conditions_input, initial_conditions_output,
+                             boundary_conditions_input, boundary_conditions_output,
+                             physics_evaluation_input, initial_conditions_grad,
+                             boundary_conditions_grad, physics_grad, physics_weight, learning_rate, device)
+            if not self.input_ndim == 4:
+                raise PINNDimensionError(f'Domain dimension is not 4 (it is {self.input_ndim})')
+            '''
+            assumes dimensions (x, y, t)
+            '''
+        
+        def dx(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 0)
+        
+        def dx_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the initial condition
+            '''
+            return self.partial_diff_init(output, 0)
+        
+        def dx_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 0)
+        
+        def dy(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 1)
+        
+        def dy_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the initial condition
+            '''
+            return self.partial_diff_init(output, 1)
+        
+        def dy_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to x for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 1)
+        
+        def dz(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to z for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 2)
+        
+        def dz_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to z for the initial condition
+            '''
+            return self.partial_diff_init(output, 2)
+        
+        def dz_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to z for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 2)
+        
+        def dt(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the physics evaluation points
+            '''
+            return self.partial_diff_physics(output, 3)
+        
+        def dt_init(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the initial condition
+            '''
+            return self.partial_diff_init(output, 3)
+        
+        def dt_boundary(self, output: torch.tensor) -> torch.Tensor:
+            '''
+            derivative with respect to time for the boundary condition
+            '''
+            return self.partial_diff_boundary(output, 3)
 
-        def diff_physics(self, y_physics: torch.tensor, axis: int) -> torch.tensor:
-            return self.diff(y_physics, self.x_grid_physics, axis)
-
-        def diff_init(self, y_init: torch.tensor, axis: int) -> torch.tensor:
-            return self.diff(y_init, self.x_grid_init, axis)
-
-        def diff_boundary(self, y_boundary: torch.tensor, axis: int) -> torch.tensor:
-            return self.diff(y_boundary, self.x_grid_boundary, axis)
-
-        def dx(self, y_physics: torch.tensor) -> torch.tensor:
-            return self.diff_physics(y_physics, 0)
-
-        def dy(self, y_physics: torch.tensor) -> torch.tensor:
-            if self.n_dim_physics < 2:
-                raise PINNDimensionError() 
-            return self.diff_physics(y_physics, 1)
-
-        def dz(self, y_physics: torch.tensor) -> torch.tensor:
-            if self.n_dim_physics < 3:
-                raise PINNDimensionError()
-            return self.diff_physics(y_physics, 2)
-
-        def __str__(self) -> str:
-            return f'PINN_X({self.pinn_sizes})'
-
-    class PINN_XT(PINN_X):
-        def __init__(self, sizes: Tuple[int, ...], physics_weight: float = 0.1, learning_rate: float = 0.0001, device: Optional[Union[torch.device, str]] = None) -> None:
-            if sizes[0] < 2:
-                raise PINNLayerSizeError(
-                    f'XT grid based PINN should have a input layer of dimension 2 or greater, not {sizes[0]}')
-            super().__init__(sizes, physics_weight, learning_rate, device)
-
-        def set_init_condition(self, ys: np.ndarray, ts: np.ndarray, *xss: np.ndarray, requires_grad: bool = False) -> None:
-            return super().set_init_condition(ys, *xss, ts, requires_grad=requires_grad)
-
-        def set_boundary_condition(self, ys: np.ndarray, ts: np.ndarray, *xss: np.ndarray, requires_grad: bool = False) -> None:
-            return super().set_boundary_condition(ys, *xss, ts, requires_grad=requires_grad)
-
-        def set_physics_condition(self, ts: np.ndarray, *xss: np.ndarray, requires_grad: bool = True) -> None:
-            return super().set_physics_condition(*xss, ts, requires_grad=requires_grad)
-
-        def dt(self, y_physics: torch.tensor) -> torch.tensor:
-            return self.diff_physics(y_physics, self.pinn_sizes[0]-1)
-
-        def __str__(self) -> str:
-            return f'PINN_XT({self.pinn_sizes})'
 
 else:
     class NoTorch:
@@ -510,7 +597,7 @@ if __name__ == '__main__':
 
     def damped_oscillator_pinn_2d():
         from examples import damped_oscillator_2d_analytical
-        pinn = PINN([2] + [16]*4 + [2], learning_rate=1e-2,
+        pinn = PINN_2D([2] + [16]*4 + [2], learning_rate=1e-2,
                     physics_weight=5e-1, device='cpu')
 
         t_init = np.array([0], dtype=np.float32)
